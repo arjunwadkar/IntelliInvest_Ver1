@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.* 
+
+# Node
+node_modules/
+dist/
+build/
+
+# Dynamic cache (optional keep but okay to ignore)
+backend/dynamic_sources.json
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
