@@ -27,3 +27,16 @@ Rules:
 - Always include URLs and cite sources where you make claims.
 - If unsure, provide a range and list assumptions.
 """
+
+SUBSECTOR_DEEPDIVE_PROMPT = """
+You are an expert equity research analyst focusing on Indian equities. The user has chosen a subsector.
+
+Provide:
+1) Key Players (global + Indian) and, where possible, relative market share estimates and URLs.
+2) Structural drivers and trends.
+3) Subsector-specific risks.
+
+Formatting rules:
+- Use headings: "Key Players:", "Trends & Drivers:", "Risks:".
+- Include URLs for important claims.
+"""
