@@ -1,16 +1,18 @@
-# run_agent.py
-from research_agent import app
+# AgentCode/run_agent.py
+"""
+Small CLI to test run_analysis locally.
+Usage: python run_agent.py --mode=stub --sector="Automobiles" --subsector="Tyres"
+"""
+import argparse
+import json
+from .research_agent import run_analysis
 
 if __name__ == "__main__":
-    sector_input = input("Enter a sector to analyze: ").strip()
-    output = app.invoke({"user_message": sector_input})
-    print("\n=== Sector Overview ===\n")
-    print(output.get("assistant_response", ""))
-    stage = output.get("stage")
-    if stage == "subsector_detail":
-        subsector_choice = input("\nWhich subsector to deep dive? ")
-        output2 = app.invoke({"user_message": subsector_choice, "stage": "subsector_detail"})
-        print("\n=== Subsector Deep Dive ===\n")
-        print(output2.get("assistant_response", ""))
-    else:
-        print("\nNo subsectors detected; done.")
+    p = argparse.ArgumentParser()
+    p.add_argument('--mode', default='stub')
+    p.add_argument('--sector', default='Automobiles')
+    p.add_argument('--subsector', default='')
+    p.add_argument('--prompt', default='')
+    args = p.parse_args()
+    out = run_analysis(mode=args.mode, sector=args.sector, subsector=args.subsector, prompt=args.prompt, use_cache=False)
+    print(json.dumps(out, indent=2))

@@ -1,0 +1,8 @@
+{
+  "USE_STUB": false,
+  "MODEL": "gpt-4o-mini",
+  "USE_TAVILY": true,
+  "APP_MODE": "real",
+  "mode": "stub",
+  "use_tavily": false
+}

@@ -1,192 +1,229 @@
-# research_agent.py
+# AgentCode/research_agent.py
+"""
+LangGraph-compatible research agent shim.
 
-from typing import TypedDict, Literal, List
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from prompts import SECTOR_ANALYSIS_PROMPT
-from prompts import SECTOR_ANALYSIS_PROMPT as _S  # keep naming consistent
-from prompts import SUBSECTOR_DEEPDIVE_PROMPT
-from sources import (
-    get_combined_sources,
-    add_dynamic_sources_for_subsector,
-    get_dynamic_subsector_entry,
-    is_entry_expired,
-    DEFAULT_TTL_DAYS
-)
+Exposes:
+  run_analysis(mode='stub'|'real', sector=None, subsector=None, prompt=None) -> dict
+
+Behavior:
+- mode == 'stub' returns deterministic mock response
+- mode == 'real' will attempt:
+    1. to call a Python LangGraph SDK (if configured) via _call_langgraph_sdk()
+    2. otherwise to call a CLI-based langgraph command via _call_langgraph_cli()
+- Normalizes outputs to {"overview":..., "Companies": {...}, "sector":..., "subsector":..., "raw":...}
+- Uses a simple file TTL cache to avoid expensive repeated runs.
+"""
+
 import os
-import re
+import json
+import hashlib
+import pathlib
+import subprocess
+import sys
+import traceback
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
 
-# Tavily import guard
-try:
-    from tavily import TavilyClient
-except Exception:
-    TavilyClient = None
+# ===== CONFIG =====
+CACHE_DIR = os.environ.get('RESEARCH_CACHE_DIR', './.research_cache')
+CACHE_TTL_SECONDS = int(os.environ.get('RESEARCH_CACHE_TTL', str(60 * 60 * 6)))  # 6 hours
+LANGGRAPH_PY_SDK_AVAILABLE = os.environ.get('LANGGRAPH_PY_SDK_AVAILABLE', 'false').lower() in ('1','true','yes')
+LANGGRAPH_GRAPH_PATH = os.environ.get('LANGGRAPH_GRAPH_PATH', 'graph.json')
+LANGGRAPH_CLI_CMD = os.environ.get('LANGGRAPH_CLI_CMD', f'langgraph run --graph {LANGGRAPH_GRAPH_PATH}')
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-class AgentState(TypedDict, total=False):
-    user_message: str
-    assistant_response: str
-    stage: Literal["sector_overview", "subsector_detail", "done"]
+# ===== Helpers: cache =====
+def _cache_key_for_inputs(mode: str, sector: Optional[str], subsector: Optional[str], prompt: Optional[str]) -> str:
+    payload = json.dumps({
+        'mode': mode,
+        'sector': sector or '',
+        'subsector': subsector or '',
+        'prompt': prompt or ''
+    }, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
-# Initialize LLM
-llm = ChatOpenAI(model="gpt-4o-mini")
-
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-tavily_client = None
-if TavilyClient and TAVILY_API_KEY:
-    tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-
-def norm_key(s: str) -> str:
-    k = s.lower().strip()
-    k = re.sub(r"[^\w\s]", "", k)
-    k = re.sub(r"\s+", "_", k)
-    return k
-
-def extract_urls_from_tavily_results(results) -> List[str]:
-    urls = []
-    if not results:
-        return urls
-    items = results.get("results") if isinstance(results, dict) else results
-    if isinstance(items, dict):
-        items = [items]
-    if not items:
-        return urls
-    for it in items:
-        if isinstance(it, dict):
-            for key in ("url", "link", "href", "source_url"):
-                if key in it and isinstance(it[key], str):
-                    urls.append(it[key])
-            if "document" in it and isinstance(it["document"], dict):
-                maybe_url = it["document"].get("url") or it["document"].get("source")
-                if isinstance(maybe_url, str):
-                    urls.append(maybe_url)
-            for v in it.values():
-                if isinstance(v, str) and v.startswith("http"):
-                    urls.append(v)
-        elif isinstance(it, str) and it.startswith("http"):
-            urls.append(it)
-    urls = list(dict.fromkeys([u.split("#")[0] for u in urls if isinstance(u, str)]))
-    return urls
-
-def tavily_search_and_persist(sector: str, max_results: int = 5) -> List[str]:
-    if not tavily_client:
-        return []
-    query = f"Market size, India share, subsectors, growth forecast for {sector} sector"
+def _load_from_cache(key: str) -> Optional[Dict[str, Any]]:
+    path = pathlib.Path(CACHE_DIR) / f"{key}.json"
+    if not path.exists():
+        return None
     try:
-        if hasattr(tavily_client, "search"):
-            results = tavily_client.search(query=query, max_results=max_results)
-        elif hasattr(tavily_client, "query"):
-            results = tavily_client.query(query=query, max_results=max_results)
-        elif hasattr(tavily_client, "run"):
-            results = tavily_client.run(query=query, max_results=max_results)
-        else:
-            results = tavily_client.search(query=query, max_results=max_results)
+        meta = json.loads(path.read_text(encoding='utf-8'))
+        ts = datetime.fromisoformat(meta.get('_cached_at'))
+        if (datetime.utcnow() - ts).total_seconds() > CACHE_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            return None
+        return meta.get('payload')
     except Exception:
-        return []
-    urls = extract_urls_from_tavily_results(results)
-    if urls:
-        key = norm_key(sector)
-        add_dynamic_sources_for_subsector(key, urls)
-    return urls
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
 
-def get_relevant_sources_text(sector: str, ttl_days: int = DEFAULT_TTL_DAYS) -> str:
-    combined = get_combined_sources()
-    sector_key = norm_key(sector)
+def _write_to_cache(key: str, payload: Dict[str, Any]):
+    path = pathlib.Path(CACHE_DIR) / f"{key}.json"
+    wrapped = {'_cached_at': datetime.utcnow().isoformat(), 'payload': payload}
+    try:
+        path.write_text(json.dumps(wrapped, default=str), encoding='utf-8')
+    except Exception:
+        pass
 
-    refs = []
+# ===== Helpers: robust LLM call =====
+def _safe_llm_call(llm, prompt: str, **kwargs) -> str:
+    """
+    Attempt popular invocation patterns and return textual result (best-effort).
+    Replace/extend per your LLM client specifics.
+    """
+    try:
+        if hasattr(llm, "invoke"):
+            r = llm.invoke(prompt, **kwargs)
+            return getattr(r, "content", None) or getattr(r, "text", None) or str(r)
+        if callable(llm):
+            try:
+                r = llm(prompt)
+            except TypeError:
+                r = llm({"input": prompt})
+            return getattr(r, "content", None) or getattr(r, "text", None) or str(r)
+        if hasattr(llm, "generate"):
+            r = llm.generate([prompt])
+            # many libs store text under r.generations[0][0].text
+            try:
+                return r.generations[0][0].text
+            except Exception:
+                return str(r)
+    except Exception:
+        return f"[LLM_CALL_FAILED] {traceback.format_exc()}"
+    return ""
 
-    # baseline global + india
-    for url in combined.get("global", {}).get("market_research", []):
-        refs.append(url)
-    for url in combined.get("india", {}).get("industry_reports", []):
-        refs.append(url)
+# ===== LangGraph integration points =====
+def _call_langgraph_sdk(graph_path: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Replace this pseudocode with your LangGraph Python SDK usage (if available).
+    Example:
+      from langgraph import Pipeline
+      pipeline = Pipeline.from_file(graph_path)
+      result = pipeline.run(inputs)
+      return result
+    """
+    raise NotImplementedError("LangGraph Python SDK path not implemented in this template.")
 
-    # try to find matching dynamic entry
-    dynamic_entry = get_dynamic_subsector_entry(sector_key)
-    matched = False
-    if dynamic_entry:
-        # if not expired, use it
-        if not is_entry_expired(dynamic_entry, ttl_days=ttl_days):
-            matched = True
-            refs.extend(dynamic_entry.get("urls", []))
+def _call_langgraph_cli(graph_path: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fallback CLI invocation. Ensure your langgraph CLI accepts JSON on stdin and returns JSON on stdout.
+    If your CLI differs, adjust LANGGRAPH_CLI_CMD or this function.
+    """
+    cmd = LANGGRAPH_CLI_CMD.split()
+    if '--graph' not in cmd and graph_path:
+        cmd += ['--graph', graph_path]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdin_payload = json.dumps(inputs)
+        stdout, stderr = proc.communicate(stdin_payload, timeout=300)
+        if proc.returncode != 0:
+            raise RuntimeError(f"LangGraph CLI failed: {stderr.strip()}")
+        return json.loads(stdout)
+    except Exception as e:
+        raise
+
+# ===== Stub generator =====
+def _stub_result(sector: Optional[str], subsector: Optional[str], prompt: Optional[str]) -> Dict[str, Any]:
+    companies = {
+        "MRF": {
+            "Market Share": "20%",
+            "Products Manufactured": "Tyres",
+            "Key Raw Materials": "Natural Rubber, Carbon Black"
+        },
+        "JKTYRE": {
+            "Market Share": "10%",
+            "Products Manufactured": "Tyres",
+            "Key Raw Materials": "Synthetic Rubber, Steel"
+        }
+    }
+    return {
+        "overview": f"[STUB] Summary for {sector or 'Generic sector'} / {subsector or 'all'}",
+        "sector": sector or "",
+        "subsector": subsector or "",
+        "Companies": companies,
+        "prompt_used": prompt or ""
+    }
+
+# ===== Public API =====
+def run_analysis(mode: str = 'stub', sector: Optional[str] = None, subsector: Optional[str] = None,
+                 prompt: Optional[str] = None, use_cache: bool = True) -> Dict[str, Any]:
+    """
+    Main entrypoint used by server.py
+    Returns a normalized dict with keys: overview, Companies, sector, subsector, raw
+    """
+    mode = (mode or 'stub').lower()
+    sector = sector or ""
+    subsector = subsector or ""
+    prompt = prompt or ""
+
+    cache_key = _cache_key_for_inputs(mode, sector, subsector, prompt)
+    if use_cache:
+        cached = _load_from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+    # stub faster path
+    if mode == 'stub':
+        res = _stub_result(sector, subsector, prompt)
+        if use_cache:
+            _write_to_cache(cache_key, res)
+        return res
+
+    # real mode
+    inputs = {"sector": sector, "subsector": subsector, "prompt": prompt, "timestamp": datetime.utcnow().isoformat()}
+    result = None
+    # Try SDK first (if configured)
+    if LANGGRAPH_PY_SDK_AVAILABLE:
+        try:
+            result = _call_langgraph_sdk(LANGGRAPH_GRAPH_PATH, inputs)
+        except Exception:
+            result = None
+
+    # Fallback to CLI
+    if result is None:
+        try:
+            result = _call_langgraph_cli(LANGGRAPH_GRAPH_PATH, inputs)
+        except Exception as exc:
+            # Return a safe error structure
+            err = {
+                "overview": "",
+                "Companies": {},
+                "sector": sector,
+                "subsector": subsector,
+                "raw": None,
+                "error": f"LangGraph invocation failed: {str(exc)}",
+                "error_stack": traceback.format_exc()
+            }
+            if use_cache:
+                _write_to_cache(cache_key, err)
+            return err
+
+    # Normalize result into expected shape
+    normalized = {"sector": sector, "subsector": subsector, "overview": "", "Companies": {}, "raw": result}
+    # If result already contains keys, use them
+    if isinstance(result, dict):
+        if 'overview' in result or 'Companies' in result:
+            normalized['overview'] = result.get('overview', '')
+            normalized['Companies'] = result.get('Companies', {}) or {}
+            normalized['raw'] = result
         else:
-            # expired -> refresh via Tavily (if available)
-            if tavily_client:
-                new_urls = tavily_search_and_persist(sector, max_results=5)
-                if new_urls:
-                    matched = True
-                    refs.extend(new_urls)
-    # try curated subsectors
-    subsectors = combined.get("subsectors", {}) or {}
-    for k, urls in subsectors.items():
-        if k in sector_key or sector_key in k:
-            matched = True
-            refs.extend(urls)
+            # Try to detect assistant_response or similar
+            if 'assistant_response' in result:
+                try:
+                    parsed = json.loads(result['assistant_response'])
+                    if isinstance(parsed, dict):
+                        normalized['overview'] = parsed.get('overview', '')
+                        normalized['Companies'] = parsed.get('Companies', {})
+                        normalized['raw'] = parsed
+                except Exception:
+                    normalized['overview'] = str(result.get('assistant_response'))
+            else:
+                # Fallback: put stringified result in raw
+                normalized['raw'] = result
 
-    # If nothing matched and no dynamic found -> run tavily fallback (also persists)
-    if not matched and tavily_client:
-        tavily_urls = tavily_search_and_persist(sector)
-        refs.extend(tavily_urls)
-
-    refs = list(dict.fromkeys([u for u in refs if u]))
-    return "\n".join(refs)
-
-def subsectors_exist_in_text(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    if "subsectors:" in t:
-        parts = t.split("subsectors:", 1)
-        after = parts[1]
-        for line in after.splitlines():
-            s = line.strip()
-            if s.startswith("-") or s.startswith("*") or re.match(r"^\d+\.", s):
-                if len(s) > 2 and not any(w in s for w in ("no subsectors", "none", "n/a")):
-                    return True
-        return False
-    if any(kw in t for kw in ("subsector", "sub-sectors", "segments:", "segments")):
-        return True
-    return False
-
-# Nodes
-def sector_overview_node(state: AgentState):
-    sector = state["user_message"]
-    refs_text = get_relevant_sources_text(sector)
-    full_prompt = f"""{SECTOR_ANALYSIS_PROMPT}
-
-Additional reference URLs (for guidance, cite if relevant):
-{refs_text}
-
-Sector to analyze: {sector}
-"""
-    response = llm.invoke(full_prompt)
-    text = response.content
-    state["assistant_response"] = text
-    if subsectors_exist_in_text(text):
-        state["stage"] = "subsector_detail"
-    else:
-        state["stage"] = "done"
-    return state
-
-def subsector_detail_node(state: AgentState):
-    subsector = state["user_message"]
-    refs_text = get_relevant_sources_text(subsector)
-    full_prompt = f"""{SUBSECTOR_DEEPDIVE_PROMPT}
-
-Additional reference URLs (for guidance, cite if relevant):
-{refs_text}
-
-Subsector to analyze: {subsector}
-"""
-    response = llm.invoke(full_prompt)
-    state["assistant_response"] = response.content
-    state["stage"] = "done"
-    return state
-
-# Build graph
-graph = StateGraph(AgentState)
-graph.add_node("sector_overview", sector_overview_node)
-graph.add_node("subsector_detail", subsector_detail_node)
-graph.set_entry_point("sector_overview")
-graph.add_edge("sector_overview", "subsector_detail")
-graph.add_edge("subsector_detail", END)
-app = graph.compile()
+    if use_cache:
+        _write_to_cache(cache_key, normalized)
+    return normalized
